@@ -14,7 +14,7 @@ import traceback
 MODEL_PATH = "/Volumes/External/Pneumonia_Detection_system/backend/BackendForML/saved_res_model_dir"
 OUTPUT_DIR = "static/"
 API_KEY = "SPRING_TO_FASTAPI_SECRET"   # Must match Spring Boot
-SPRING_BOOT_ORIGIN = "http://localhost:8081"
+SPRING_BOOT_ORIGIN = "http://192.168.0.3:8081"
 # ==================================================
 
 # --- Load SavedModel ---
@@ -104,72 +104,52 @@ def root():
     return {"message": "ML Pneumonia Detection Service is running"}
 
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(...),
-    x_api_key: str = Header(...)
-):
-    # --- API KEY CHECK ---
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
+async def predict(file: UploadFile = File(...)):
     try:
+        # Read the uploaded image
         img_bytes = await file.read()
+        image = Image.open(BytesIO(img_bytes))
+        original_image = image.copy()  # Keep the original image
 
-        try:
-            image = Image.open(BytesIO(img_bytes))
-        except (UnidentifiedImageError, IOError):
-            image = Image.open(BytesIO(img_bytes)).convert("RGB")
-
-        original_image = image.copy()
-
-        # Preprocess
+        # Preprocess the image
         preprocessed_image = preprocess_image(image)
 
-        # Prediction
-        predictions = infer(
-            tf.convert_to_tensor(preprocessed_image, dtype=tf.float32)
-        )
-        prediction_mask = predictions["output_0"].numpy()[0, :, :, 0]
-        max_probability = float(np.max(prediction_mask))
+        # Perform inference
+        predictions = infer(tf.convert_to_tensor(preprocessed_image, dtype=tf.float32))
+        prediction_mask = predictions['output_0'].numpy()[0, :, :, 0]  # Extract mask
 
-        # Bounding box
-        bbox_path = os.path.join(
-            OUTPUT_DIR,
-            f"{os.path.splitext(file.filename)[0]}_bbox.png"
-        )
+        # Calculate sigmoid probability
+        probabilities = tf.nn.sigmoid(predictions['output_0']).numpy()
+        max_probability = np.max(probabilities)  # Extract the maximum probability
 
-        pneumonia_detected, localized_path = overlay_bounding_box(
-            original_image,
-            prediction_mask,
-            bbox_path
+        # Prepare output paths
+        output_filename = os.path.join(
+            OUTPUT_DIR, f"{os.path.splitext(file.filename)[0]}_localized.png"
         )
 
-        localized_base64 = None
-        if pneumonia_detected and localized_path:
-            with open(localized_path, "rb") as f:
-                localized_base64 = base64.b64encode(f.read()).decode()
-
-        # Heatmap
-        heatmap_overlay = overlay_heatmap(original_image, prediction_mask)
-        heatmap_path = os.path.join(
-            OUTPUT_DIR,
-            f"{os.path.splitext(file.filename)[0]}_gradcam.png"
+        # Overlay bounding box (if any) and check for pneumonia
+        pneumonia_detected, localized_image_path = overlay_bounding_box(
+            original_image, prediction_mask, output_filename
         )
-        cv2.imwrite(heatmap_path, heatmap_overlay)
+ 
+        if pneumonia_detected:
+            with open(localized_image_path, "rb") as img_file:
+                img_base64 = base64.b64encode(img_file.read()).decode("utf-8")
+            result = {
+                "diagnosis": "Pneumonia",
+                "probability": round(float(max_probability), 3),
+                "localized_image": img_base64,
+                "lung_opacity": "Present"
+            }
+        else:
+            result = {
+                "diagnosis": "No Pneumonia",
+                "probability": round(float(max_probability), 3),
+                "localized_image": "",
+                "lung_opacity": "Absent"
+            }
 
-        with open(heatmap_path, "rb") as f:
-            heatmap_base64 = base64.b64encode(f.read()).decode()
-
-        return JSONResponse({
-            "diagnosis": "Pneumonia" if pneumonia_detected else "No Pneumonia",
-            "probability": max_probability,
-            "localized_image": localized_base64,
-            "gradcam_image": heatmap_base64
-        })
+        return JSONResponse(content=result)
 
     except Exception as e:
-        traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+        return JSONResponse(status_code=500, content={"error": str(e)})
